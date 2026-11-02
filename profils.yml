@@ -1,0 +1,32 @@
+# Profils d'audit : quel script du framework tourne sur quel type de serveur.
+# Un serveur peut cumuler plusieurs profils (ex. profil=dc_principal,fichiers) : les listes
+# sont fusionnees, dedoublonnees et lancees dans l'ordre des numeros.
+#
+# Les numeros renvoient aux scripts de framework/Scripts/PowerShell (10 -> 10_Audit_comptes_T0.ps1).
+# Un numero sans script correspondant est ignore. Jamais lances par Ansible, quel que soit le profil :
+#   00 (reconnaissance : remplacee par l'inventaire), 12 (M365 : remplace par Scripts/M365/Audit_M365.py,
+#   lance par lancer_audit.sh si m365_tenant= est renseigne),
+#   23 (Linux : remplace par files/Audit_Linux.sh), scripts prefixes par "_".
+#
+# Choix du profil d'un serveur (par ordre de priorite, cumulables) :
+#   1. variable sur la ligne du serveur dans clients/<CLIENT>.ini : profil=dc_principal,fichiers
+#   2. section du meme nom dans le .ini : [dc_principal] (le serveur doit AUSSI etre dans [windows])
+#   3. rien de precise, ou profil=auto : detection (poste / serveur / dc / dc_principal = PDC / hyperv /
+#      fichiers = serveur hors DC avec des partages)
+# Ajustement fin par serveur : scripts_ajout=31,32  scripts_retrait=21
+
+audit_profils:
+  poste:        ["10", "11", "22"]
+  serveur:      ["10", "11", "21"]
+  fichiers:     ["10", "11", "31"]
+  hyperv:       ["10", "11", "20"]
+  dc:           ["21", "30"]
+  dc_principal: ["10", "11", "13", "21", "30",     # un seul par domaine : donnees du domaine
+                 "31", "32", "33", "34", "35", "36", "37"]
+
+# Scripts exclus d'office
+# audit_exclus: ["00", "12", "23"]
+
+# Script lance en 2e phase, une fois les CSV NTFS de TOUS les serveurs rapatries
+# (croisement ReferenceNTFS de 33_Audit_Groupes)
+audit_phase2: ["33"]

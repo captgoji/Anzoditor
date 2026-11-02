@@ -1,0 +1,836 @@
+# audit.yml - Lance le framework NewAuditro sur les serveurs d'un client, en parallele
+#
+# Lancement :   ./lancer_audit.sh FACO
+#   (ou : ansible-playbook audit.yml -i clients/FACO.ini -e report_name=..._FACO_audit)
+#
+# Remplace 00_Reconnaissance : les serveurs viennent de clients/<CLIENT>.ini, le choix des scripts
+# par serveur vient de profils.yml (variable profil=... dans le .ini, ou detection automatique).
+#
+# Deroulement :
+#   0. Preparation (machine Ansible) : dossier de rapport, liste des scripts du framework
+#   1. Windows (WinRM) : detection du role -> profils -> scripts ; copie dans C:\Windows\Temp\Audit_<id>,
+#      execution (phase 1), rapatriement ; phase 2 = 33_Audit_Groupes avec les CSV NTFS de TOUS
+#      les serveurs ; nettoyage du dossier distant dans tous les cas
+#      + inventaire des applications (CheckApp.ps1) sur chaque serveur
+#   2. Linux (SSH) : Audit_Linux.sh du framework (sans sudo) + CheckApp.sh (sudo : journaux apt / zypper)
+#      2a. VMware [esxi] (API vSphere)  2b. reseau [reseau] (SNMP)  2c. controleurs UniFi [unifi] (API)
+#      -> lances depuis la machine Ansible, rien n'est execute sur ces equipements
+#   3. Synthese (machine Ansible) : statut.csv, CSV applications fusionnes (Temp_CSV/APP),
+#      Excel (Process_excels.py) si openpyxl est installe
+#
+# Resultat dans rapports/<report_name>/ :
+#   Temp_CSV/<serveur>/<Comptes|AD|HV|VM|NTFS>/...   meme arborescence que l'audit distant historique
+#   Temp_CSV/APP/<client>_Audit_Applications[_Alertes].csv   applications de tous les serveurs
+#   logs/<serveur>/<script>.log                       sortie de chaque script
+#   Excel/                                            classeurs + Synthese_Audit.xlsx
+#   statut.csv                                        une ligne par serveur
+#
+# Variables utiles (-e ...) : framework_dir=/chemin/NewAuditroV2  keep_remote=true (garde le dossier distant)
+#   audit_apps=false (pas d'inventaire des applications ; aussi possible par serveur dans le .ini)
+#   detail_conteneurs=true (Linux : liste aussi les paquets installes dans chaque conteneur)
+
+# ---------------------------------------------------------------
+# 0. Preparation (machine Ansible)
+# ---------------------------------------------------------------
+- name: Preparation
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Identifiant du lancement et chemins
+      ansible.builtin.set_fact:
+        run_id: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+        fw_dir: "{{ framework_dir | default(playbook_dir ~ '/framework') }}"
+
+    - name: Dossier de rapport
+      ansible.builtin.set_fact:
+        report_dir: "{{ playbook_dir }}/rapports/{{ report_name | default(run_id ~ '_' ~ (client | default('client')) ~ '_audit', true) }}"
+
+    - name: Verifier la presence du framework
+      ansible.builtin.assert:
+        that:
+          - (fw_dir ~ '/Scripts/PowerShell') is directory
+        fail_msg: "Framework introuvable dans {{ fw_dir }} : creer le lien (ln -s /mnt/c/.../NewAuditroV2 framework) ou passer -e framework_dir=..."
+        quiet: true
+
+    - name: Scripts du framework (numero -> fichier), scripts prefixes par "_" ignores
+      ansible.builtin.set_fact:
+        script_par_num: "{{ script_par_num | default({}) | combine({(item | basename)[:2]: item | basename}) }}"
+      loop: "{{ query('fileglob', fw_dir ~ '/Scripts/PowerShell/[0-9][0-9]_*.ps1') | sort }}"
+      loop_control:
+        label: "{{ item | basename }}"
+
+    - name: Scripts d'inventaire des applications (framework, sinon files/ de checkApp.yml)
+      ansible.builtin.set_fact:
+        app_dir: "{{ (fw_dir ~ '/Scripts/Applications') if (fw_dir ~ '/Scripts/Applications/CheckApp.ps1') is file else (playbook_dir ~ '/files') }}"
+
+    - name: Creer les dossiers du rapport
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ report_dir }}/Temp_CSV"
+        - "{{ report_dir }}/Temp_CSV/APP"
+        - "{{ report_dir }}/logs"
+
+# ---------------------------------------------------------------
+# 1. Serveurs Windows (WinRM)
+# ---------------------------------------------------------------
+- name: Audit Windows
+  hosts: windows
+  gather_facts: false
+  vars_files:
+    - profils.yml
+  vars_prompt:
+    - name: win_password
+      prompt: "Mot de passe du compte Windows (Keeper)"
+      private: true
+  vars:
+    ansible_connection: winrm
+    ansible_winrm_transport: ntlm
+    ansible_port: 5985
+    ansible_winrm_scheme: http
+    # Mot de passe par compte (multi-domaine) : mdp= dans le .ini, sinon mdp_win[compte ou ansible_user] saisi
+    # dans lancer_audit.sh ;
+    # sinon le mot de passe unique demande ci-dessus (lancement direct par ansible-playbook)
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+    # mdp= dans le .ini (ligne du serveur ou [windows:vars]) prioritaire sur les mots de passe saisis
+    ansible_password: "{{ mdp | default((mdp_win | default({})).get(cle_mdp, win_password), true) }}"
+    # become runas = vrais identifiants dans la session -> pas de probleme de double saut
+    # (partages d'autres serveurs pour 31_, repadmin vers les autres DC pour 30_, liens DFS)
+    ansible_become_password: "{{ ansible_password }}"
+
+    ctrl: "{{ hostvars['localhost'] }}"
+    run_id: "{{ ctrl.run_id }}"
+    report_dir: "{{ ctrl.report_dir }}"
+    rdir: 'C:\Windows\Temp\Audit_{{ run_id }}'
+
+    # Variables du framework transmises si elles sont definies dans le .ini (en minuscules)
+    audit_env_vars:
+      - AUDIT_NTFS_PATHS
+      - AUDIT_NTFS_DEPTH
+      - AUDIT_NTFS_DFS_DEPTH
+      - AUDIT_NTFS_EXCLURE
+      - AUDIT_NTFS_MAX_DOSSIERS
+      - AUDIT_NTFS_SIZE_DEPTH
+      - AUDIT_GROUPES_REPLMETA
+
+    # Lance UN script dans un processus PowerShell dedie (un 'exit' du script ne tue rien),
+    # avec les memes variables AUDIT_* que main.ps1 / 00_Reconnaissance. Sortie -> logs\<script>.log
+    ps_lancer: |
+      $ErrorActionPreference = 'Continue'
+      $base = '{{ rdir }}'
+      $o    = "$base\out"
+      $env:AUDIT_TEMP_CSV       = $o
+      $env:AUDIT_TEMP_COMPTES   = "$o\Comptes"
+      $env:AUDIT_TEMP_AD        = "$o\AD"
+      $env:AUDIT_TEMP_HV        = "$o\HV"
+      $env:AUDIT_TEMP_VM        = "$o\VM"
+      $env:AUDIT_TEMP_NTFS      = "$o\NTFS"
+      $env:AUDIT_RUN_ID         = '{{ run_id }}'
+      $env:AUDIT_NONINTERACTIVE = '1'
+      $croisement = '{{ ntfs_croisement | default("") }}'
+      if ($croisement) { $env:AUDIT_TEMP_NTFS = $croisement }
+      {% for v in audit_env_vars %}
+      {% if hostvars[inventory_hostname][v | lower] is defined %}
+      $env:{{ v }} = '{{ hostvars[inventory_hostname][v | lower] | string | replace("'", "''") }}'
+      {% endif %}
+      {% endfor %}
+      $nom = '{{ script }}'
+      $log = "$base\logs\$([IO.Path]::GetFileNameWithoutExtension($nom)).log"
+      & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$base\Scripts\$nom" *>&1 |
+          Out-File -FilePath $log -Encoding UTF8 -Width 400
+      $code = $LASTEXITCODE
+      "$nom : code $code"
+      exit $code
+
+    # Liste des fichiers produits, chemins relatifs a $base : w = out\AD\x.csv (source), u = out/AD/x.csv (destination)
+    ps_lister: |
+      $base = '{{ rdir }}'
+      $f = @(Get-ChildItem -Path "$base\out", "$base\logs" -Recurse -File -Include *.csv, *.txt, *.html, *.log -ErrorAction SilentlyContinue |
+             ForEach-Object { $r = $_.FullName.Substring($base.Length + 1); [ordered]@{ w = $r; u = $r.Replace('\', '/') } })
+      ConvertTo-Json -InputObject $f -Compress
+
+  tasks:
+    - name: Audit du serveur
+      block:
+        # --- Role et profils --------------------------------------------------
+        - name: Detection du role (DC / PDC / Hyper-V / partages / poste)
+          ansible.windows.win_shell: |
+            $cs   = Get-CimInstance Win32_ComputerSystem
+            $role = [int]$cs.DomainRole        # 0,1 poste ; 2,3 serveur ; 4,5 DC
+            $pdc  = $false
+            if ($role -ge 4) {
+                try {
+                    Import-Module ActiveDirectory -ErrorAction Stop
+                    $pdc = (((Get-ADDomain -ErrorAction Stop).PDCEmulator -split '\.')[0]) -ieq $env:COMPUTERNAME
+                } catch {}
+            }
+            $hyperv   = [bool](Get-Service -Name vmms -ErrorAction SilentlyContinue)
+            $partages = @(Get-SmbShare -ErrorAction SilentlyContinue | Where-Object {
+                $_.Path -and $_.Name -notmatch '^(ADMIN\$|[A-Za-z]\$|IPC\$|print\$|SYSVOL|NETLOGON)$' }).Count
+            [ordered]@{
+                fqdn = "$env:COMPUTERNAME.$($cs.Domain)"; domain_role = $role; pdc = $pdc
+                hyperv = $hyperv; partages = $partages; ps = $PSVersionTable.PSVersion.Major
+            } | ConvertTo-Json -Compress
+          register: detect
+          changed_when: false
+          ignore_unreachable: true    # un serveur injoignable ne doit pas arreter les plays Linux / Synthese
+
+        - name: Serveur injoignable - ignore
+          ansible.builtin.meta: end_host
+          when: detect.unreachable | default(false)
+
+        - name: Profils retenus
+          ansible.builtin.set_fact:
+            role_detecte: "{{ r }}"
+            profils_effectifs: >-
+              {{ ((demandes | reject('equalto', 'auto') | list)
+                  + (auto if (demandes | length == 0 or 'auto' in demandes) else []))
+                 | unique | list }}
+          vars:
+            r: "{{ detect.stdout | from_json }}"
+            p: "{{ profil | default('') }}"
+            demandes: >-
+              {{ ((p if (p is iterable and p is not string) else (p | string).split(','))
+                  | map('string') | map('trim') | select | list)
+                 + (group_names | select('in', audit_profils) | list) }}
+            auto: >-
+              {{ (['poste'] if r.domain_role < 2 else (['serveur'] if r.domain_role < 4 else ['dc']))
+                 + (['dc_principal'] if r.pdc else [])
+                 + (['hyperv'] if r.hyperv else [])
+                 + (['fichiers'] if (r.partages | int > 0 and r.domain_role < 4) else []) }}
+
+        - name: Scripts a lancer
+          ansible.builtin.set_fact:
+            nums: "{{ n }}"
+            audit_scripts: "{{ n | map('extract', ctrl.script_par_num) | list }}"
+            scripts_phase1: "{{ n | reject('in', ph2) | map('extract', ctrl.script_par_num) | list }}"
+            scripts_phase2: "{{ n | select('in', ph2) | map('extract', ctrl.script_par_num) | list }}"
+          vars:
+            # Chaque liste accepte indifferemment ["21","30"], [21, 30] ou "21,30" (ini ou profils.yml) :
+            # [x] | flatten -> liste, puis join/split -> numeros en texte
+            ajout:   "{{ ([scripts_ajout | default([])] | flatten | map('string') | join(',')).split(',') | map('trim') | select | list }}"
+            retrait: "{{ ([scripts_retrait | default([])] | flatten | map('string') | join(',')).split(',') | map('trim') | select | list }}"
+            exclus:  "{{ ([audit_exclus | default([])] | flatten | map('string') | join(',')).split(',') | map('trim') | select | list }}"
+            ph2:     "{{ ([audit_phase2 | default([])] | flatten | map('string') | join(',')).split(',') | map('trim') | select | list }}"
+            du_profil: "{{ (profils_effectifs | select('in', audit_profils) | map('extract', audit_profils) | flatten | map('string') | join(',')).split(',') | map('trim') | select | list }}"
+            n: "{{ (du_profil + ajout) | difference(retrait + exclus) | select('in', ctrl.script_par_num) | unique | sort | list }}"
+
+        - name: Plan
+          ansible.builtin.debug:
+            msg: >-
+              {{ role_detecte.fqdn }} | profils : {{ profils_effectifs | join(', ') }}
+              {{- ' | profil(s) inconnu(s) : ' ~ (inconnus | join(', ')) if inconnus else '' }}
+              | scripts : {{ nums | join(', ') if nums else 'AUCUN' }}
+          vars:
+            inconnus: "{{ profils_effectifs | reject('in', audit_profils) | list }}"
+
+        - name: Controle des DC principaux (un seul par domaine)
+          ansible.builtin.debug:
+            msg: >-
+              ATTENTION : {{ nb_principal }} DC principal(aux) pour {{ nb_dc }} DC.
+              {{ 'Aucun DC principal : comptes, GPO, groupes, PSO, silos et OU ne seront pas audites (profil=dc_principal sur un DC).'
+                 if nb_principal == 0 else 'Plusieurs DC principaux : donnees du domaine collectees en double.' }}
+          run_once: true
+          when: (nb_dc | int > 0 and nb_principal | int == 0) or nb_principal | int > 1
+          vars:
+            tous: "{{ ansible_play_hosts | map('extract', hostvars, 'profils_effectifs') | list }}"
+            nb_dc: "{{ tous | select('contains', 'dc') | list | length }}"
+            nb_principal: "{{ tous | select('contains', 'dc_principal') | list | length }}"
+
+        # --- Preparation du serveur ----------------------------------------
+        - name: Dossiers de travail sur le serveur
+          ansible.windows.win_file:
+            path: '{{ rdir }}\{{ item }}'
+            state: directory
+          loop:
+            - Scripts
+            - logs
+            - NTFS_croisement
+            - out\Comptes
+            - out\AD
+            - out\HV
+            - out\VM
+            - out\NTFS
+          when: audit_scripts | length > 0
+
+        - name: Copier les scripts retenus
+          ansible.windows.win_copy:
+            src: "{{ ctrl.fw_dir }}/Scripts/PowerShell/{{ item }}"
+            dest: '{{ rdir }}\Scripts\'
+          loop: "{{ audit_scripts }}"
+
+        # --- Phase 1 --------------------------------------------------------
+        - name: Phase 1 - lancer les scripts
+          ansible.windows.win_shell: "{{ ps_lancer }}"
+          vars:
+            script: "{{ item }}"
+          loop: "{{ scripts_phase1 }}"
+          register: run1
+          become: true
+          become_method: ansible.builtin.runas
+          become_user: "{{ ansible_user }}"
+          failed_when: false
+          changed_when: false
+
+        - name: Inventaire des applications (CheckApp.ps1, resultat renvoye sur la sortie)
+          ansible.builtin.script: "{{ ctrl.app_dir }}/CheckApp.ps1"
+          register: app
+          changed_when: false
+          failed_when: false
+          when: audit_apps | default(true) | bool
+
+        - name: Phase 1 - liste des fichiers produits
+          ansible.windows.win_shell: "{{ ps_lister }}"
+          register: liste1
+          changed_when: false
+          when: audit_scripts | length > 0
+
+        - name: Phase 1 - rapatrier
+          ansible.builtin.fetch:
+            src: '{{ rdir }}\{{ item.w }}'
+            dest: '{{ report_dir }}/{{ ("Temp_CSV/" ~ inventory_hostname ~ "/" ~ item.u[4:]) if item.u.startswith("out/") else ("logs/" ~ inventory_hostname ~ "/" ~ item.u[5:]) }}'
+            flat: true
+          loop: "{{ liste1.stdout | default('[]') | from_json }}"
+          loop_control:
+            label: "{{ item.u }}"
+
+        # --- Phase 2 : 33_Audit_Groupes avec les CSV NTFS de tous les serveurs --
+        # (la tache precedente est terminee sur TOUS les serveurs avant que celle-ci demarre)
+        - name: Phase 2 - CSV NTFS rapatries de tous les serveurs (machine Ansible)
+          ansible.builtin.find:
+            paths: "{{ report_dir }}/Temp_CSV"
+            recurse: true
+            patterns: ["*_Audit_NTFS.csv", "*_Audit_NTFS_Partages.csv"]
+          register: csv_ntfs
+          delegate_to: localhost
+          run_once: true
+          vars:
+            # sinon la tache delegue herite de ansible_connection=winrm du play
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+        - name: Phase 2 - deposer les CSV NTFS de tous les serveurs
+          ansible.windows.win_copy:
+            src: "{{ item }}"
+            dest: '{{ rdir }}\NTFS_croisement\'
+          loop: "{{ csv_ntfs.files | default([]) | map(attribute='path') | list }}"
+          loop_control:
+            label: "{{ item | basename }}"
+          when: scripts_phase2 | length > 0
+
+        - name: Phase 2 - lancer les scripts
+          ansible.windows.win_shell: "{{ ps_lancer }}"
+          vars:
+            script: "{{ item }}"
+            ntfs_croisement: '{{ rdir }}\NTFS_croisement'
+          loop: "{{ scripts_phase2 }}"
+          register: run2
+          become: true
+          become_method: ansible.builtin.runas
+          become_user: "{{ ansible_user }}"
+          failed_when: false
+          changed_when: false
+
+        - name: Phase 2 - liste des fichiers produits
+          ansible.windows.win_shell: "{{ ps_lister }}"
+          register: liste2
+          changed_when: false
+          when: scripts_phase2 | length > 0
+
+        - name: Phase 2 - rapatrier (les fichiers deja recuperes et inchanges sont ignores)
+          ansible.builtin.fetch:
+            src: '{{ rdir }}\{{ item.w }}'
+            dest: '{{ report_dir }}/{{ ("Temp_CSV/" ~ inventory_hostname ~ "/" ~ item.u[4:]) if item.u.startswith("out/") else ("logs/" ~ inventory_hostname ~ "/" ~ item.u[5:]) }}'
+            flat: true
+          loop: "{{ liste2.stdout | default('[]') | from_json }}"
+          loop_control:
+            label: "{{ item.u }}"
+
+        - name: Serveur termine
+          ansible.builtin.set_fact:
+            audit_fini: true
+
+      rescue:
+        # Erreur sur ce serveur : on la note pour statut.csv sans bloquer les autres plays
+        - name: Erreur sur ce serveur
+          ansible.builtin.set_fact:
+            audit_erreur: "{{ (ansible_failed_task.name | default('')) ~ ' : ' ~ (ansible_failed_result.msg | default('') | string) }}"
+
+      always:
+        - name: Nettoyage du dossier distant
+          ansible.windows.win_file:
+            path: "{{ rdir }}"
+            state: absent
+          when: not (keep_remote | default(false) | bool)
+
+# ---------------------------------------------------------------
+# 2. Serveurs Linux (SSH)
+# ---------------------------------------------------------------
+- name: Audit Linux
+  hosts: linux
+  gather_facts: false
+  vars_prompt:
+    - name: linux_password
+      prompt: "Mot de passe SSH du compte Linux (Keeper, Entree si cle SSH)"
+      private: true
+    - name: linux_become_password
+      prompt: "Mot de passe sudo (Entree si identique)"
+      private: true
+  vars:
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+    # mdp= / mdp_sudo= dans le .ini prioritaires ; sudo = mot de passe SSH si non renseigne
+    ansible_password: "{{ mdp | default((mdp_lin | default({})).get(cle_mdp, linux_password), true) }}"
+    ansible_become_password: "{{ mdp_sudo | default((mdp_sudo_lin | default({})).get(cle_mdp, ''), true) or linux_become_password | default('', true) or ansible_password }}"
+    ctrl: "{{ hostvars['localhost'] }}"
+    report_dir: "{{ ctrl.report_dir }}"
+    dest_dir: "{{ report_dir }}/Temp_CSV/{{ inventory_hostname }}"
+  tasks:
+    # sudo teste a part avec un delai court : un mauvais mot de passe sur un serveur en francais
+    # ("Desole, essayez de nouveau") n'est pas reconnu par Ansible et bloquerait la tache indefiniment
+    # Connexion directe en root (Proxmox, conteneurs LXC : sudo souvent absent) -> pas de sudo
+    - name: Compte de connexion (root ?)
+      ansible.builtin.command: id -u
+      register: id_u
+      changed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+
+    - name: Test sudo (30 s maximum)
+      ansible.builtin.command: /bin/true
+      register: sudo_test
+      become: true
+      timeout: 30
+      changed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+      when: (id_u.stdout | default('') | trim) != '0'
+
+    # root : tout est lisible sans sudo ; sinon sudo seulement s'il fonctionne
+    - name: Droits de l'audit
+      ansible.builtin.set_fact:
+        est_root: "{{ (id_u.stdout | default('') | trim) == '0' }}"
+        avec_sudo: "{{ (id_u.stdout | default('') | trim) != '0' and (sudo_test.rc | default(1)) == 0 }}"
+        privilegie: "{{ (id_u.stdout | default('') | trim) == '0' or (sudo_test.rc | default(1)) == 0 }}"
+        raison_sudo: >-
+          {%- set ok = (id_u.stdout | default('') | trim) == '0' or (sudo_test.rc | default(1)) == 0 -%}
+          {%- set t = (sudo_test.msg | default('')) ~ ' ' ~ (sudo_test.module_stderr | default('')) ~ ' ' ~ (sudo_test.stderr | default('')) -%}
+          {%- if ok -%}
+          {%- elif t is search('(?i)sudoers|apparait pas|not allowed|n.est pas autoris') -%}compte absent des sudoers (ou commande non autorisee)
+          {%- elif t is search('(?i)sorry|d.sol|incorrect|duplicate become password|incorrect password|missing sudo password') -%}mot de passe sudo refuse (mdp_sudo= dans le .ini, ou Entree = mot de passe SSH)
+          {%- elif t is search('(?i)sudo: (command )?not found|sudo: introuvable|no such file') -%}sudo non installe sur le serveur (se connecter en root ou installer sudo)
+          {%- elif t is search('(?i)timeout|timed out|d.lai') -%}sudo sans reponse en 30 s
+          {%- else -%}{{ t | regex_replace('\\s+', ' ') | trim | truncate(300) }}{%- endif -%}
+      when: not (id_u.unreachable | default(false))
+
+    - name: Lancer Audit_Linux.sh (lecture seule ; sudo si disponible pour le numero de serie)
+      ansible.builtin.script: "{{ ctrl.fw_dir }}/Scripts/Linux/Audit_Linux.sh {{ ansible_host | default(inventory_hostname) }}"
+      register: lin
+      become: "{{ avec_sudo | default(false) }}"
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+    - name: Comptes locaux (Audit_Linux_Comptes.sh ; sudo pour /etc/shadow, sinon etat du mot de passe inconnu)
+      ansible.builtin.script: "{{ ctrl.fw_dir }}/Scripts/Linux/Audit_Linux_Comptes.sh"
+      register: cpt
+      become: "{{ avec_sudo | default(false) }}"
+      timeout: 300
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+
+    - name: Inventaire des applications (CheckApp.sh ; sudo pour les journaux apt / zypper, sinon sans)
+      ansible.builtin.script: "{{ ctrl.app_dir }}/CheckApp.sh {{ '--detail-conteneurs' if (detail_conteneurs | default(false) | bool) else '' }}"
+      register: app
+      become: "{{ avec_sudo | default(false) }}"
+      timeout: "{{ audit_app_timeout | default(900) | int }}"
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+      when: audit_apps | default(true) | bool
+
+    # Proxmox VE : ne fait rien sur un Linux sans pvesh ; pvesh exige root (sudo)
+    - name: Proxmox VE (Audit_Proxmox.pl, si le serveur est un Proxmox)
+      ansible.builtin.script: "{{ ctrl.fw_dir }}/Scripts/Virtualisation/Audit_Proxmox.pl"
+      args:
+        executable: perl
+      register: pve
+      become: "{{ avec_sudo | default(false) }}"
+      timeout: 900
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+      ignore_unreachable: true
+      when:
+        - privilegie | default(false)
+        - (ctrl.fw_dir ~ '/Scripts/Virtualisation/Audit_Proxmox.pl') is file
+
+    - name: Dossiers du serveur dans le rapport
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ dest_dir }}"
+        - "{{ dest_dir }}/Comptes"
+        - "{{ dest_dir }}/HV"
+        - "{{ report_dir }}/Temp_CSV/VIRTU"
+        - "{{ report_dir }}/logs/{{ inventory_hostname }}"
+      delegate_to: localhost
+
+    - name: Log brut
+      ansible.builtin.copy:
+        content: "{{ lin.stdout | default('') }}{{ lin.stderr | default('') }}{{ lin.msg | default('') }}"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_Linux.log"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Log brut des comptes
+      ansible.builtin.copy:
+        content: "{{ cpt.stdout | default('') }}{{ cpt.stderr | default('') }}{{ cpt.msg | default('') }}"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_Linux_Comptes.log"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Log brut des applications
+      ansible.builtin.copy:
+        content: "{{ app.stdout | default('') }}{{ app.stderr | default('') }}{{ app.msg | default('') }}"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/CheckApp.log"
+        mode: "0644"
+      delegate_to: localhost
+      when: app.skipped is not defined
+
+    - name: Log brut Proxmox
+      ansible.builtin.copy:
+        content: "{{ pve.stderr | default('') }}{{ pve.msg | default('') }}"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_Proxmox.log"
+        mode: "0644"
+      delegate_to: localhost
+      when: pve.skipped is not defined and ((pve.stderr | default('') ~ pve.msg | default('')) | trim | length > 0)
+
+    - name: Log sudo (raison de l'audit sans sudo)
+      ansible.builtin.copy:
+        content: "{{ raison_sudo }}\n"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/sudo.log"
+        mode: "0644"
+      delegate_to: localhost
+      when: raison_sudo | default('') | length > 0
+
+    - name: CSV Proxmox (hote -> Temp_CSV/<serveur>/HV, VM / stockage / securite -> Temp_CSV/VIRTU)
+      ansible.builtin.copy:
+        content: "{{ item.split('\n', 1)[1] | default('') }}"
+        dest: "{{ (dest_dir ~ '/HV/' ~ inventory_hostname ~ '_Audit_Hyperviseurs.csv') if nom_f == 'HV' else (report_dir ~ '/Temp_CSV/VIRTU/' ~ inventory_hostname ~ '_Audit_Virtu_' ~ nom_f ~ '.csv') }}"
+        mode: "0644"
+      vars:
+        nom_f: "{{ item.split('\n', 1)[0] | trim }}"
+      loop: "{{ (pve.stdout | default('') | replace('\\r', '')).split('#### FICHIER:')[1:] }}"
+      loop_control:
+        label: "{{ item.split('\n', 1)[0] }}"
+      delegate_to: localhost
+      when: pve.stdout is defined and '#### FICHIER:' in pve.stdout
+
+    - name: CSV Linux (lu par Process_excels dans Temp_CSV/<serveur>/<serveur>_Audit_Linux.csv)
+      ansible.builtin.copy:
+        content: "{{ lin.stdout_lines | select | join('\n') ~ '\n' }}"
+        dest: "{{ dest_dir }}/{{ inventory_hostname }}_Audit_Linux.csv"
+        mode: "0644"
+      delegate_to: localhost
+      when:
+        - not (lin.unreachable | default(false))
+        - (lin.rc | default(1)) == 0
+        - (lin.stdout_lines | default([]) | select | list | length) > 1
+
+    # Meme format que 11_ (Comptes) et 10_ (Comptes_T0, lignes "Tier 0") -> classeur <serveur>_Audit_Comptes.xlsx
+    - name: CSV comptes Linux (Temp_CSV/<serveur>/Comptes/)
+      ansible.builtin.copy:
+        content: "{{ ([lignes[0]] + (lignes[1:] | select('search', item.filtre) | list)) | join('\n') ~ '\n' }}"
+        dest: "{{ dest_dir }}/Comptes/{{ inventory_hostname }}_Audit_comptes{{ item.suffixe }}.csv"
+        mode: "0644"
+      vars:
+        lignes: "{{ cpt.stdout_lines | map('trim') | select | list }}"
+      loop:
+        - { suffixe: "", filtre: "." }
+        - { suffixe: "_T0", filtre: "Tier 0" }
+      loop_control:
+        label: "{{ inventory_hostname }}_Audit_comptes{{ item.suffixe }}.csv"
+      delegate_to: localhost
+      when:
+        - cpt.stdout_lines is defined
+        - not (cpt.unreachable | default(false))
+        - (cpt.rc | default(1)) == 0
+        - (cpt.stdout_lines | select | list | length) > 1
+
+# ---------------------------------------------------------------
+# 2a. VMware ESXi / vCenter (API vSphere en lecture seule, depuis la machine Ansible)
+#     .ini : section [esxi], une ligne par ESXi isole OU le vCenter seul : ansible_host=IP ansible_user=compte
+#     [mdp='...'] ; outil requis : sudo apt install python3-pyvmomi
+# ---------------------------------------------------------------
+- name: Audit VMware (ESXi / vCenter)
+  hosts: esxi
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ctrl: "{{ hostvars['localhost'] }}"
+    report_dir: "{{ ctrl.report_dir }}"
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+  tasks:
+    - name: Interroger l'API vSphere (Audit_ESXi.py)
+      ansible.builtin.command:
+        argv: ["python3", "{{ ctrl.fw_dir }}/Scripts/Virtualisation/Audit_ESXi.py", "--cible", "{{ inventory_hostname }}",
+               "--hote", "{{ ansible_host | default(inventory_hostname) }}", "--port", "{{ vsphere_port | default(443) }}",
+               "--sortie", "{{ report_dir }}/Temp_CSV/VIRTU"]
+      environment:
+        VSPHERE_USER: "{{ ansible_user | default('') }}"
+        VSPHERE_PASSWORD: "{{ mdp | default((mdp_esxi | default({})).get(cle_mdp, ''), true) }}"
+      register: esx
+      timeout: 1800
+      changed_when: false
+      failed_when: false
+
+    - name: Dossier de logs
+      ansible.builtin.file:
+        path: "{{ report_dir }}/logs/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Log vSphere
+      ansible.builtin.copy:
+        content: "{{ esx.stdout | default('') }}\n{{ esx.stderr | default('') }}{{ esx.msg | default('') }}\n"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_ESXi.log"
+        mode: "0644"
+
+# ---------------------------------------------------------------
+# 2b. Equipements reseau (SNMP en lecture seule, depuis la machine Ansible)
+#     .ini : section [reseau], une ligne par switch / borne : ansible_host=IP [type=switch|wifi] [marque=...]
+#     identifiants : snmp_communaute='...' (v1/v2c) ou snmp_version=3 + snmp_v3_user / _auth_pass / _priv_pass...
+#     (sur la ligne ou dans [reseau:vars]) ; outils requis : sudo apt install snmp
+# ---------------------------------------------------------------
+- name: Audit reseau (SNMP)
+  hosts: reseau
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ctrl: "{{ hostvars['localhost'] }}"
+    report_dir: "{{ ctrl.report_dir }}"
+  tasks:
+    - name: Interroger l'equipement en SNMP (Audit_Reseau_SNMP.py)
+      ansible.builtin.command:
+        argv: "{{ ['python3', ctrl.fw_dir ~ '/Scripts/Reseau/Audit_Reseau_SNMP.py',
+                   '--hote', inventory_hostname, '--ip', ansible_host | default(inventory_hostname),
+                   '--type', type | default('auto'), '--marque', marque | default(''),
+                   '--sortie', report_dir ~ '/Temp_CSV/RESEAU']
+                  + (['--sans-test-ports'] if not (reseau_test_ports | default(true) | bool) else []) }}"
+      environment:
+        SNMP_VERSION: "{{ snmp_version | default('2c') }}"
+        SNMP_COMMUNAUTE: "{{ snmp_communaute | default('') }}"
+        SNMP_PORT: "{{ snmp_port | default('161') }}"
+        SNMP_V3_USER: "{{ snmp_v3_user | default('') }}"
+        SNMP_V3_NIVEAU: "{{ snmp_v3_niveau | default('authPriv') }}"
+        SNMP_V3_AUTH_PROTO: "{{ snmp_v3_auth_proto | default('SHA') }}"
+        SNMP_V3_AUTH_PASS: "{{ snmp_v3_auth_pass | default('') }}"
+        SNMP_V3_PRIV_PROTO: "{{ snmp_v3_priv_proto | default('AES') }}"
+        SNMP_V3_PRIV_PASS: "{{ snmp_v3_priv_pass | default('') }}"
+      register: snmp
+      timeout: 900
+      changed_when: false
+      failed_when: false
+
+    - name: Dossier de logs de l'equipement
+      ansible.builtin.file:
+        path: "{{ report_dir }}/logs/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Log SNMP
+      ansible.builtin.copy:
+        content: "{{ snmp.stdout | default('') }}\n{{ snmp.stderr | default('') }}{{ snmp.msg | default('') }}\n"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_Reseau.log"
+        mode: "0644"
+
+# ---------------------------------------------------------------
+# 2c. Controleurs UniFi (API UniFi Network en lecture seule, depuis la machine Ansible)
+#     .ini : section [unifi], une ligne par controleur (UDM, Cloud Key, UniFi OS Server, controleur 8443) :
+#       NOM  ansible_host=IP  ansible_user=compte_local_lecture_seule  [mdp='...']  [unifi_port=11443]  [unifi_site=default]
+#     Tous les switchs / bornes / passerelles du controleur sont audites (ports, VLAN, Wi-Fi) :
+#     ne PAS les declarer aussi dans [reseau]. Aucun outil a installer.
+# ---------------------------------------------------------------
+- name: Audit UniFi (controleur)
+  hosts: unifi
+  gather_facts: false
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    ctrl: "{{ hostvars['localhost'] }}"
+    report_dir: "{{ ctrl.report_dir }}"
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+  tasks:
+    - name: Interroger le controleur UniFi (Audit_UniFi.py)
+      ansible.builtin.command:
+        argv: "{{ ['python3', ctrl.fw_dir ~ '/Scripts/Reseau/Audit_UniFi.py', '--nom', inventory_hostname,
+                   '--hote', ansible_host | default(inventory_hostname), '--port', (unifi_port | default(0)) | string,
+                   '--site', unifi_site | default(''), '--sortie', report_dir ~ '/Temp_CSV/RESEAU'] }}"
+      environment:
+        UNIFI_USER: "{{ ansible_user | default('') }}"
+        UNIFI_PASSWORD: "{{ mdp | default((mdp_unifi | default({})).get(cle_mdp, ''), true) }}"
+      register: unifi
+      timeout: 900
+      changed_when: false
+      failed_when: false
+
+    - name: Dossier de logs du controleur
+      ansible.builtin.file:
+        path: "{{ report_dir }}/logs/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Log UniFi
+      ansible.builtin.copy:
+        content: "{{ unifi.stdout | default('') }}\n{{ unifi.stderr | default('') }}{{ unifi.msg | default('') }}\n"
+        dest: "{{ report_dir }}/logs/{{ inventory_hostname }}/Audit_UniFi.log"
+        mode: "0644"
+
+# ---------------------------------------------------------------
+# 3. Synthese (machine Ansible)
+# ---------------------------------------------------------------
+- name: Synthese
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hotes_win: "{{ groups['windows'] | default([]) }}"
+    hotes_lin: "{{ groups['linux'] | default([]) }}"
+    hotes_res: "{{ groups['reseau'] | default([]) }}"
+    hotes_esx: "{{ groups['esxi'] | default([]) }}"
+    hotes_uni: "{{ groups['unifi'] | default([]) }}"
+  tasks:
+    - name: Statut par serveur
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/statut.csv"
+        mode: "0644"
+        content: |
+          {% macro nb_apps(a) -%}
+          {%- if a.skipped is defined or a == {} -%}-
+          {%- elif a.unreachable | default(false) or (a.rc | default(1)) != 0 or (a.stdout_lines | default([]) | select | list | length) < 2 -%}ERREUR
+          {%- else -%}{{ (a.stdout_lines | select | list | length) - 1 }}{%- endif -%}
+          {%- endmacro %}
+          serveur;os;profils;scripts;scripts_en_erreur;fichiers;applications;statut
+          {% for s in hotes_win %}
+          {%   set h = hostvars[s] %}
+          {%   set r1 = h.run1 | default({}) %}
+          {%   set r2 = h.run2 | default({}) %}
+          {%   set runs = (r1.results | default([])) + (r2.results | default([])) %}
+          {%   set ko = runs | selectattr('rc', 'defined') | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list %}
+          {%   set l2 = h.liste2 | default({}) %}
+          {%   set l = l2 if (l2.stdout is defined) else (h.liste1 | default({})) %}
+          {%   set fic = (l.stdout | default('[]')) | from_json | map(attribute='u') | select('match', '^out/') | list | length %}
+          {%   if h.detect is not defined or (h.detect.unreachable | default(false)) %}{% set st = 'INJOIGNABLE' %}
+          {%   elif not (h.audit_fini | default(false)) %}{% set st = 'ERREUR ' ~ (h.audit_erreur | default('voir la sortie Ansible') | regex_replace('[\\r\\n;]+', ' ') | truncate(200)) %}
+          {%   elif ko %}{% set st = 'PARTIEL' %}
+          {%   else %}{% set st = 'OK' %}{% endif %}
+          {{ s }};Windows;{{ h.profils_effectifs | default([]) | join(',') }};{{ h.nums | default([]) | join(',') }};{{ ko | join(',') }};{{ fic }};{{ nb_apps(h.app | default({})) }};{{ st }}
+          {% endfor %}
+          {% for s in hotes_lin %}
+          {%   set r = hostvars[s].lin | default({}) %}
+          {%   if r.unreachable | default(false) or r == {} %}{% set st = 'INJOIGNABLE' %}
+          {%   elif (r.rc | default(1)) != 0 %}{% set st = 'ERREUR' %}
+          {%   elif not (hostvars[s].privilegie | default(true)) %}{% set st = 'OK SANS SUDO (S/N, etat des mots de passe et Proxmox non collectes ; voir logs/' ~ s ~ '/sudo.log)' %}
+          {%   else %}{% set st = 'OK' %}{% endif %}
+          {%   set c = hostvars[s].cpt | default({}) %}
+          {%   set cko = (c.unreachable | default(false)) or (c.rc | default(1)) != 0 or (c.stdout_lines | default([]) | select | list | length) < 2 %}
+          {%   set pv = hostvars[s].pve | default({}) %}
+          {{ s }};Linux;{{ 'proxmox' if '#### FICHIER:' in (pv.stdout | default('')) else '' }};Audit_Linux,Audit_Linux_Comptes{{ ',Audit_Proxmox' if '#### FICHIER:' in (pv.stdout | default('')) else '' }};{{ 'Audit_Linux_Comptes' if (cko and st.startswith('OK')) else '' }};{{ ((1 if st.startswith('OK') else 0) + (0 if cko else 2)) }};{{ nb_apps(hostvars[s].app | default({})) }};{{ st }}
+          {% endfor %}
+          {% set m365 = lookup('ansible.builtin.fileglob', report_dir ~ '/Temp_CSV/M365/*_Audit_Comptes_365.csv', wantlist=True) %}
+          {% if m365 %}
+          Microsoft 365;Cloud;;Audit_M365;;{{ lookup('ansible.builtin.fileglob', report_dir ~ '/Temp_CSV/M365/*.csv', wantlist=True) | length }};-;OK
+          {% endif %}
+          {% set gws = lookup('ansible.builtin.fileglob', report_dir ~ '/Temp_CSV/GWS/*_Audit_GWS_Comptes.csv', wantlist=True) %}
+          {% if gws %}
+          Google Workspace;Cloud;;Audit_GWS;;{{ lookup('ansible.builtin.fileglob', report_dir ~ '/Temp_CSV/GWS/*.csv', wantlist=True) | length }};-;OK
+          {% endif %}
+          {% for s in hotes_esx %}
+          {%   set r = hostvars[s].esx | default({}) %}
+          {%   if r == {} %}{% set st = 'NON LANCE' %}
+          {%   elif (r.rc | default(1)) != 0 %}{% set st = 'ERREUR ' ~ ((r.stderr | default(r.msg | default(''))) | regex_replace('[\\r\\n;]+', ' ') | truncate(150)) %}
+          {%   elif 'INJOIGNABLE' in (r.stdout | default('')) %}{% set st = 'INJOIGNABLE (vSphere)' %}
+          {%   else %}{% set st = 'OK' %}{% endif %}
+          {{ s }};VMware;;Audit_ESXi;;-;-;{{ st }}
+          {% endfor %}
+          {% for s in hotes_res %}
+          {%   set r = hostvars[s].snmp | default({}) %}
+          {%   if r == {} %}{% set st = 'NON LANCE' %}
+          {%   elif (r.rc | default(1)) != 0 %}{% set st = 'ERREUR ' ~ ((r.stderr | default(r.msg | default(''))) | regex_replace('[\\r\\n;]+', ' ') | truncate(150)) %}
+          {%   elif 'INJOIGNABLE' in (r.stdout | default('')) %}{% set st = 'INJOIGNABLE (SNMP)' %}
+          {%   else %}{% set st = 'OK' %}{% endif %}
+          {{ s }};Reseau;{{ hostvars[s].type | default('auto') }};SNMP;;{{ 5 if st == 'OK' else (1 if st.startswith('INJ') else 0) }};-;{{ st }}
+          {% endfor %}
+          {% for s in hotes_uni %}
+          {%   set r = hostvars[s].unifi | default({}) %}
+          {%   if r == {} %}{% set st = 'NON LANCE' %}
+          {%   elif (r.rc | default(1)) != 0 %}{% set st = 'ERREUR ' ~ ((r.stderr | default(r.msg | default(''))) | regex_replace('[\\r\\n;]+', ' ') | truncate(200)) %}
+          {%   else %}{% set st = 'OK' %}{% endif %}
+          {{ s }};UniFi;controleur;Audit_UniFi;;{{ 6 if st == 'OK' else 1 }};-;{{ st }}
+          {% endfor %}
+
+    # Applications de tous les serveurs dans UN CSV (1re colonne = nom du serveur dans l'inventaire)
+    # + un CSV des seules alertes PHP / Node.js a traiter (colonne alerte ni vide ni OK)
+    - name: CSV applications (tous serveurs) et alertes
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/Temp_CSV/APP/{{ client | default('client') }}_Audit_Applications{{ item.suffixe }}.csv"
+        mode: "0644"
+        content: |
+          serveur;name;version;install_date;source;publisher;installed_by;ports_ecoute;exposition;alerte
+          {% for s in hotes_win + hotes_lin %}
+          {%   set a = hostvars[s].app | default({}) %}
+          {%   if a.stdout_lines is defined and not (a.unreachable | default(false)) and (a.rc | default(1)) == 0 %}
+          {%     for l in (a.stdout_lines | map('trim') | select | list)[1:] %}
+          {%       set al = (l.split(';') + ['', '', '', '', '', '', '', '', '', ''])[9] %}
+          {%       if not item.alertes or (al and not al.startswith('OK')) %}
+          {{ l | regex_replace('^[^;]*', s) }}
+          {%       endif %}
+          {%     endfor %}
+          {%   endif %}
+          {% endfor %}
+      loop:
+        - { suffixe: "", alertes: false }
+        - { suffixe: "_Alertes", alertes: true }
+      loop_control:
+        label: "{{ client | default('client') }}_Audit_Applications{{ item.suffixe }}.csv"
+      when: (hotes_win + hotes_lin) | map('extract', hostvars) | selectattr('app', 'defined') | selectattr('app.stdout_lines', 'defined') | list | length > 0
+
+    - name: Generer les Excel (Process_excels.py du framework, sur la copie du rapport)
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ report_dir }}"
+        FW="{{ fw_dir }}"
+        cp "$FW/Process_excels.py" "$FW/modules_config.json" .
+        # Process_excels cherche "Synthese_audit.py" (casse importante sous Linux)
+        S=$(ls "$FW"/[Ss]ynthese_[Aa]udit.py "$FW"/Scripts/Python/[Ss]ynthese_[Aa]udit.py 2>/dev/null | head -1 || true)
+        [ -n "$S" ] && cp "$S" ./Synthese_audit.py
+        mkdir -p Scripts && cp -r "$FW/Scripts/Python" Scripts/
+        [ -d "$FW/Templates_Excel" ] && cp -r "$FW/Templates_Excel" . || true
+        if ! python3 -c 'import openpyxl' 2>/dev/null; then
+          echo "openpyxl absent : sudo apt install python3-openpyxl, puis relancer : cd $(pwd) && python3 Process_excels.py --force"
+          exit 0
+        fi
+        python3 Process_excels.py --force
+      args:
+        executable: /bin/bash
+      register: excel
+      changed_when: true
+
+    - name: Schemas NTFS (html / txt) et arborescence des OU a cote des Excel
+      ansible.builtin.shell: |
+        cd "{{ report_dir }}" && mkdir -p Excel
+        find Temp_CSV -type f \( -name '*_Audit_NTFS_Arborescence.html' -o -name '*_Audit_NTFS_Arborescence.txt' -o -name '*_AD_OU_Tree.txt' \) -exec cp -f {} Excel/ \; -print
+      register: schemas
+      changed_when: schemas.stdout | length > 0
+
+    - name: Resume
+      ansible.builtin.debug:
+        msg: "{{ lookup('file', report_dir ~ '/statut.csv').splitlines() + ['', 'Excel :'] + (excel.stdout_lines | select('search', 'Bilan|CSV traite|aucun CSV|INTROUVABLE|openpyxl|ERREUR') | list) }}"

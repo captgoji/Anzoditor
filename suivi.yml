@@ -1,0 +1,100 @@
+# suivi.yml - Ou en est un audit en cours ? (lecture seule, ne modifie rien)
+# Lancement :   ./suivi_audit.sh CLIENT        (dans un 2e terminal, pendant que lancer_audit.sh tourne)
+#
+# Pour chaque serveur Windows : script du framework en cours d'execution (et depuis combien de temps),
+#   dernier journal ecrit dans C:\Windows\Temp\Audit_*\logs et ses dernieres lignes.
+# Pour chaque serveur Linux : scripts d'audit en cours (Audit_Linux, comptes, CheckApp, Proxmox).
+# Un serveur "termine / en attente" a fini ses scripts et attend que les autres aient fini (Ansible
+# passe a l'etape suivante quand TOUS les serveurs ont termine la precedente).
+
+- name: Suivi Windows
+  hosts: windows
+  gather_facts: false
+  vars:
+    ansible_connection: winrm
+    ansible_winrm_transport: ntlm
+    ansible_port: 5985
+    ansible_winrm_scheme: http
+    ansible_winrm_operation_timeout_sec: 20
+    ansible_winrm_read_timeout_sec: 30
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+    ansible_password: "{{ mdp | default((mdp_win | default({})).get(cle_mdp, ''), true) }}"
+  tasks:
+    - name: Etat de l'audit sur le serveur
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+        $d = Get-ChildItem C:\Windows\Temp\Audit_* -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+        $now = Get-Date
+        $encours = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | ForEach-Object {
+            if ($_.CommandLine -match '([0-9]{2}_[A-Za-z_]+\.ps1|CheckApp\.ps1)') {
+                $m = [int]($now - $_.CreationDate).TotalMinutes
+                "$($Matches[1]) depuis $([int][math]::Floor($m / 60)) h $($m % 60) min"
+            } })
+        $log = $null; $fin = @()
+        if ($d) {
+            $log = Get-ChildItem (Join-Path $d.FullName 'logs') -File | Sort-Object LastWriteTime | Select-Object -Last 1
+            if ($log) { $fin = @(Get-Content $log.FullName -Tail ([int]'{{ suivi_lignes | default(3) }}') | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }) }
+        }
+        [ordered]@{
+            dossier = if ($d) { $d.Name } else { '' }
+            en_cours = $encours
+            dernier_log = if ($log) { "$($log.Name) ($($log.LastWriteTime.ToString('HH:mm')))" } else { '' }
+            fin_log = $fin
+        } | ConvertTo-Json -Compress
+      register: etat
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+- name: Suivi Linux
+  hosts: linux
+  gather_facts: false
+  vars:
+    cle_mdp: "{{ compte | default(ansible_user) | default('defaut') }}"
+    ansible_password: "{{ mdp | default((mdp_lin | default({})).get(cle_mdp, ''), true) }}"
+  tasks:
+    - name: Scripts d'audit en cours
+      ansible.builtin.shell: >-
+        ps -eo etimes=,args= | grep -E 'Audit_Linux|Audit_Proxmox|CheckApp' | grep -v grep |
+        awk '{s=$1; $1=""; printf "%s depuis %d h %d min\n", substr($0,2,80), s/3600, (s%3600)/60}' || true
+      register: etat
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+
+- name: Synthese du suivi
+  hosts: localhost
+  gather_facts: false
+  vars:
+    win: "{{ groups['windows'] | default([]) }}"
+    lin: "{{ groups['linux'] | default([]) }}"
+  tasks:
+    - name: Ou en est l'audit ?
+      ansible.builtin.copy:
+        content: "{{ lignes | join('\n') }}\n"
+        dest: "{{ suivi_fichier | default('/tmp/suivi_audit.txt') }}"
+        mode: "0600"
+      vars:
+        lignes: >-
+          {%- set out = [] -%}
+          {%- for s in win if hostvars[s].etat is defined -%}
+          {%-   set r = hostvars[s].etat | default({}) -%}
+          {%-   if r.unreachable | default(false) or (r.rc | default(1)) != 0 -%}
+          {%-     set _ = out.append(s ~ ' : injoignable (' ~ (r.msg | default('') | truncate(80)) ~ ')') -%}
+          {%-   else -%}
+          {%-     set j = r.stdout | default('{}') | from_json -%}
+          {%-     if not j.dossier -%}{%- set _ = out.append(s ~ ' : aucun audit sur ce serveur (pas encore commence, ou deja nettoye)') -%}
+          {%-     elif j.en_cours -%}{%- set _ = out.append(s ~ ' : EN COURS -> ' ~ ([j.en_cours] | flatten | join(', '))) -%}
+          {%-       for l in ([j.fin_log] | flatten) -%}{%- set _ = out.append('      | ' ~ (l | truncate(150))) -%}{%- endfor -%}
+          {%-     else -%}{%- set _ = out.append(s ~ ' : termine / en attente des autres (dernier journal : ' ~ j.dernier_log ~ ')') -%}
+          {%-     endif -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {%- for s in lin if hostvars[s].etat is defined -%}
+          {%-   set r = hostvars[s].etat | default({}) -%}
+          {%-   if r.unreachable | default(false) -%}{%- set _ = out.append(s ~ ' : injoignable') -%}
+          {%-   elif r.stdout | default('') | trim -%}{%- set _ = out.append(s ~ ' : EN COURS -> ' ~ (r.stdout_lines | join(', '))) -%}
+          {%-   else -%}{%- set _ = out.append(s ~ ' : aucun script d audit en cours') -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}

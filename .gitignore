@@ -1,0 +1,11 @@
+# Inventaires clients (on ne garde que l'exemple)
+clients/*
+!clients/EXEMPLE.ini
+# R?sultats d'audit
+rapports/*
+!rapports/.gitkeep
+# Divers
+*.log
+*.retry
+__pycache__/
+*.pyc
